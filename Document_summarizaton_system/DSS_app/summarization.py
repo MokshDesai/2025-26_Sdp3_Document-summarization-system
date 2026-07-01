@@ -56,13 +56,98 @@ def _default_num_threads() -> int:
 
 _MAX_CONCURRENCY = int(os.environ.get("DSS_OLLAMA_MAX_CONCURRENCY", "1"))
 _OLLAMA_SEM = threading.Semaphore(max(1, _MAX_CONCURRENCY))
+_SLOT_WAIT_TIMEOUT = float(os.environ.get("DSS_OLLAMA_SLOT_WAIT_TIMEOUT", "20"))
+_REQUEST_TIMEOUT = float(os.environ.get("DSS_OLLAMA_REQUEST_TIMEOUT", "90"))
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _build_ollama_runtime(text_len: int) -> dict[str, int | float]:
+    """Return low-power defaults to keep laptops responsive."""
+    is_macos = (platform.system() or "").lower() == "darwin"
+    profile = (os.environ.get("DSS_OLLAMA_PROFILE", "low_power") or "low_power").strip().lower()
+
+    if profile == "balanced":
+        base_max_chars = 3800 if is_macos else 5000
+        base_num_predict = 360 if is_macos else 460
+        base_num_ctx = 1792 if is_macos else 2560
+        base_num_thread = 1 if is_macos else max(1, min(4, _default_num_threads()))
+    else:
+        # Default: low power so summary generation does not hang the machine.
+        # Keep CPU usage conservative, but allow enough context/output for coverage.
+        base_max_chars = 3000 if is_macos else 4200
+        base_num_predict = 320 if is_macos else 420
+        base_num_ctx = 1536 if is_macos else 2304
+        base_num_thread = 1 if is_macos else max(1, min(3, _default_num_threads()))
+
+    # Slightly increase limits for bigger inputs, but keep hard caps.
+    if text_len > 5000:
+        base_max_chars += 350
+        base_num_predict += 40
+    if text_len > 12000:
+        base_max_chars += 350
+        base_num_predict += 40
+        base_num_ctx += 256
+
+    max_chars = _env_int("DSS_OLLAMA_MAX_CHARS", base_max_chars)
+    num_predict = _env_int("DSS_OLLAMA_NUM_PREDICT", base_num_predict)
+    num_ctx = _env_int("DSS_OLLAMA_NUM_CTX", base_num_ctx)
+    num_thread = _env_int("DSS_OLLAMA_NUM_THREAD", base_num_thread)
+    num_batch = _env_int("DSS_OLLAMA_NUM_BATCH", 64 if is_macos else 96)
+    temperature = _env_float("DSS_OLLAMA_TEMPERATURE", 0.1)
+    top_p = _env_float("DSS_OLLAMA_TOP_P", 0.8)
+
+    if is_macos:
+        max_chars = max(1800, min(4600, max_chars))
+        num_predict = max(220, min(560, num_predict))
+        num_ctx = max(1024, min(2560, num_ctx))
+        num_thread = max(1, min(2, num_thread))
+        num_batch = max(16, min(96, num_batch))
+    else:
+        max_chars = max(1800, min(6500, max_chars))
+        num_predict = max(220, min(700, num_predict))
+        num_ctx = max(1024, min(4096, num_ctx))
+        num_thread = max(1, min(6, num_thread))
+        num_batch = max(16, min(256, num_batch))
+
+    return {
+        "max_chars": max_chars,
+        "num_predict": num_predict,
+        "num_ctx": num_ctx,
+        "num_thread": num_thread,
+        "num_batch": num_batch,
+        "temperature": temperature,
+        "top_p": top_p,
+    }
 
 
 @contextmanager
 def _ollama_slot():
     """Limit concurrent Ollama generations to avoid system thrash."""
 
-    _OLLAMA_SEM.acquire()
+    acquired = _OLLAMA_SEM.acquire(timeout=max(1.0, _SLOT_WAIT_TIMEOUT))
+    if not acquired:
+        raise RuntimeError(
+            "Summarization server is busy. Please retry in a few seconds."
+        )
     try:
         yield
     finally:
@@ -191,6 +276,30 @@ def _postprocess_to_n_lines(text: str, *, target_lines: int = 20) -> str:
     if len(norm) > target_lines:
         norm = norm[:target_lines]
     return "\n".join(norm)
+
+
+def _trim_to_last_full_stop(text: str) -> str:
+    """Trim trailing incomplete fragment if output ends mid-sentence."""
+    src = (text or "").strip()
+    if not src:
+        return ""
+    if src.endswith((".", "!", "?")):
+        return src
+
+    last_stop = src.rfind(".")
+    if last_stop < 0:
+        return src
+    trimmed = src[: last_stop + 1].strip()
+    return trimmed or src
+
+
+def _finalize_summary_output(text: str) -> str:
+    """Ensure clean ending and append a brief AI accuracy note."""
+    cleaned = _trim_to_last_full_stop(text)
+    if not cleaned:
+        return ""
+    note = "- Note: This AI-generated summary may contain mistakes."
+    return f"{cleaned}\n{note}"
 
 
 def _cache_get(key: str) -> str | None:
@@ -413,20 +522,23 @@ def summarize_text(
         "- Plain text only; one bullet ('- ') per line; no markdown headings."
     )
 
+    runtime = _build_ollama_runtime(len(src))
+
     # Bound input size to keep latency predictable.
     # For speed without losing key details, we rely on smarter compression rather than harsh truncation.
     # Default tuned for smoother local runs (esp. 8GB RAM). Override via env.
-    max_chars = int(os.environ.get("DSS_OLLAMA_MAX_CHARS", "4500"))
+    max_chars = int(runtime["max_chars"])
     src = _compress_for_llm(src, max_chars=max_chars)
 
     # Cache: same input + settings => instant response.
     # Must be high enough to finish 20 factual lines; too-low values truncate mid-output.
-    num_predict = int(os.environ.get("DSS_OLLAMA_NUM_PREDICT", "480"))
+    num_predict = int(runtime["num_predict"])
     # Slightly larger context helps accuracy; override down if your machine struggles.
-    num_ctx = int(os.environ.get("DSS_OLLAMA_NUM_CTX", "2048"))
-    temperature = float(os.environ.get("DSS_OLLAMA_TEMPERATURE", "0.2"))
-    top_p = float(os.environ.get("DSS_OLLAMA_TOP_P", "0.9"))
-    num_thread = int(os.environ.get("DSS_OLLAMA_NUM_THREAD", str(_default_num_threads())))
+    num_ctx = int(runtime["num_ctx"])
+    temperature = float(runtime["temperature"])
+    top_p = float(runtime["top_p"])
+    num_thread = int(runtime["num_thread"])
+    num_batch = int(runtime["num_batch"])
     src_hash = hashlib.sha256(src.encode("utf-8", errors="ignore")).hexdigest()
     cache_key = f"v1|{model_name}|{max_chars}|{num_ctx}|{num_predict}|{temperature}|{top_p}|{src_hash}"
     cached = _cache_get(cache_key)
@@ -444,7 +556,8 @@ def summarize_text(
 
     try:
         with _ollama_slot():
-            resp = ollama.chat(
+            client = ollama.Client(host=DEFAULT_OLLAMA_HOST, timeout=max(5.0, _REQUEST_TIMEOUT))
+            resp = client.chat(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -459,6 +572,8 @@ def summarize_text(
                     "top_p": top_p,
                     # Limit CPU usage for responsiveness.
                     "num_thread": max(1, num_thread),
+                    # Smaller batch can reduce memory/compute spikes.
+                    "num_batch": max(16, num_batch),
                 },
             )
     except Exception as e:
@@ -468,6 +583,7 @@ def summarize_text(
     content = ((resp or {}).get("message") or {}).get("content")
     out = (content or "").strip()
     out = _postprocess_to_n_lines(out, target_lines=20)
+    out = _finalize_summary_output(out)
     if out:
         _cache_set(cache_key, out)
     return out
@@ -502,7 +618,8 @@ def stream_summary(
         "- Plain text only; one bullet ('- ') per line; no markdown headings."
     )
 
-    max_chars = int(os.environ.get("DSS_OLLAMA_MAX_CHARS", "4500"))
+    runtime = _build_ollama_runtime(len(src))
+    max_chars = int(runtime["max_chars"])
     src = _compress_for_llm(src, max_chars=max_chars)
 
     try:
@@ -513,18 +630,20 @@ def stream_summary(
     os.environ.setdefault("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
 
     try:
-        num_thread = int(os.environ.get("DSS_OLLAMA_NUM_THREAD", str(_default_num_threads())))
+        num_thread = int(runtime["num_thread"])
         options = {
-            "temperature": float(os.environ.get("DSS_OLLAMA_TEMPERATURE", "0.2")),
-            "num_predict": int(os.environ.get("DSS_OLLAMA_NUM_PREDICT", "480")),
-            "num_ctx": int(os.environ.get("DSS_OLLAMA_NUM_CTX", "2048")),
-            "top_p": float(os.environ.get("DSS_OLLAMA_TOP_P", "0.9")),
+            "temperature": float(runtime["temperature"]),
+            "num_predict": int(runtime["num_predict"]),
+            "num_ctx": int(runtime["num_ctx"]),
+            "top_p": float(runtime["top_p"]),
             "num_thread": max(1, num_thread),
+            "num_batch": max(16, int(runtime["num_batch"])),
         }
 
         with _ollama_slot():
             # stream=True makes the client yield incremental chunks.
-            for part in ollama.chat(
+            client = ollama.Client(host=DEFAULT_OLLAMA_HOST, timeout=max(5.0, _REQUEST_TIMEOUT))
+            for part in client.chat(
                 model=model_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
