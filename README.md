@@ -712,32 +712,7 @@ python manage.py migrate
 
 This project is licensed under the MIT License - see LICENSE file for details.
 
----
 
-## 👨‍💻 Author
-
-**Moksh Desai**  
-GitHub: [@mokshdesai](https://github.com/mokshdesai)
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please follow these steps:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
----
-
-## 💬 Support
-
-For questions or issues, please open a GitHub issue or contact the project maintainer.
-
----
 
 **Made with ❤️ for SDP 3 (2025-26)**
 
