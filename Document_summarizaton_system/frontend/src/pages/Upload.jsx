@@ -303,14 +303,30 @@ export default function Upload() {
     }
 
     try {
+      const controller = new AbortController();
+      const timeoutMs = 120000;
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
       // Summarize from the stored upload_id (preflight).
-      const res = await fetch(
-        `${API_BASE}/api/uploads/${uploadId}/summarize/`,
-        {
-          method: "POST",
-          credentials: "include",
-        },
-      );
+      let res;
+      try {
+        res = await fetch(
+          `${API_BASE}/api/uploads/${uploadId}/summarize/`,
+          {
+            method: "POST",
+            credentials: "include",
+            signal: controller.signal,
+          },
+        );
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      if (res.status === 401) {
+        storeUser(null);
+        navigate("/login", { replace: true, state: { from: "/upload" } });
+        throw new Error("Session expired. Please log in again.");
+      }
 
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error || "Failed to summarize");
@@ -390,7 +406,13 @@ export default function Upload() {
         }, 250);
       });
     } catch (err) {
-      setError(err.message || "Something went wrong");
+      if (err?.name === "AbortError") {
+        setError(
+          "Summarization timed out after 2 minutes. Ensure Ollama is running and retry with a smaller/clearer document.",
+        );
+      } else {
+        setError(err.message || "Something went wrong");
+      }
       setStatus("error");
     }
   }
